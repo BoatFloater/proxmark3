@@ -1377,13 +1377,13 @@ static int CmdHFFelicaReadSuica(const char *Cmd) {
                   " - Mode shall be Mode0.\n"
                   " - Successful == block data\n"
                   " - Unsuccessful == Status Flag1 and Flag2",
-                  "hf felica rdbl --sn 01 --scl 8B00 --bn 01 --ble 8000\n"
-                  "hf felica rdbl --sn 01 --scl 4B18 --bn 01 --ble 8000 -b\n"
-                  "hf felica rdbl -i 01100910c11bc407 --sn 01 --scl 8B00 --bn 01 --ble 8000\n"
+                  "hf felica rdsuica --bn 13\n"
+                  "hf felica rdsuica -i 01100910c11bc407 --bn 13\n"
     );
     void *argtable[] = {
             arg_param_begin,
             arg_str0("i", NULL, "<hex>", "set custom IDm"),
+            arg_str0(NULL, "bn",  "<hex>", "number of block"),
             arg_lit0("v", "verbose", "verbose output"),
             arg_param_end
     };
@@ -1398,7 +1398,19 @@ static int CmdHFFelicaReadSuica(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    bool verbose = arg_get_lit(ctx, 1);
+    uint8_t bn[1] = {0};
+    int bnlen = 0;
+    res = CLIParamHexToBuf(arg_get_str(ctx, 2), bn, sizeof(bn), &bnlen);
+    if (res) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    if (bnlen && bn[0] > 0x13) {
+        PrintAndLogEx(ERR, "Block number must be <= 0x13");
+        return PM3_EINVARG;
+    }
+
+    bool verbose = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
 
@@ -1439,6 +1451,12 @@ static int CmdHFFelicaReadSuica(const char *Cmd) {
     data[14] = 0x80;
     data[15] = 0x00; // this goes from 0x00 to 0x13
 
+    if (bnlen) {
+        if (verbose) {
+            PrintAndLogEx(INFO, "Using block number "_GREEN_("%x"), bn[0]);
+        }
+        data[15] = bn[0];
+    }
 
     uint8_t flags = (FELICA_APPEND_CRC | FELICA_RAW);
     AddCrc(data, datalen);
