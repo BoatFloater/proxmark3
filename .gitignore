@@ -120,5 +120,8 @@ fpga_version_info.c
 !.vscode/extensions.json
 !.vscode/tasks.json
 
+# IntelliJ files
+.idea/
+
 # docs
 !doc/*.json

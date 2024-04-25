@@ -257,6 +257,46 @@ static const char *felica_model_name(uint8_t rom_type, uint8_t ic_type) {
     return "Unknown IC Type";
 }
 
+static const char *suica_console_name(uint8_t console_id) {
+    // source: https://github.com/m2wasabi/nfcpy-suica-sample/blob/e550c704890ba66149fcbb5f78ce15e66bc2ef60/suica_read.py#L68
+    switch (console_id) {
+        case 0x03:
+            return "Payment Machine";
+        case 0x04:
+            return "Handheld Device";
+        case 0x05:
+            return "In-Vehicle Terminal";
+        case 0x12:
+            return "Ticket Machine";
+        case 0x16:
+            return "Ticket Gate";
+        case 0x1c:
+            return "Transit Payment Machine";
+        case 0xc8:
+            return "Vending Machine";
+        default:
+            break;
+    }
+    return "Unknown Console";
+}
+
+static const char *suica_process_name(uint8_t process_id) {
+    // source: https://github.com/m2wasabi/nfcpy-suica-sample/blob/e550c704890ba66149fcbb5f78ce15e66bc2ef60/suica_read.py#L82
+    switch (process_id) {
+        case 0x01:
+            return "Fare Payment";
+        case 0x02:
+            return "Charge";
+        case 0x0f:
+            return "Bus";
+        case 0x46:
+            return "Product";
+        default:
+            break;
+    }
+    return "Unknown Process";
+}
+
 /**
  * Wait for response from pm3 or timeout.
  * Checks if receveid bytes have a valid CRC.
@@ -379,7 +419,7 @@ static int info_felica(bool verbose) {
     clearCommandBuffer();
     SendCommandMIX(CMD_HF_FELICA_COMMAND, FELICA_CONNECT, 0, 0, NULL, 0);
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 2500) == false) {
+    if (WaitForResponseTimeout(CMD_ACK, &resp, 5000) == false) {
         if (verbose) PrintAndLogEx(WARNING, "FeliCa card select failed");
         return PM3_ESOFT;
     }
@@ -419,6 +459,9 @@ static int info_felica(bool verbose) {
             set_last_known_card(card);
             break;
         }
+        default: {
+            PrintAndLogEx(WARNING, "Other status received: %s", status);
+        }
     }
     return PM3_SUCCESS;
 }
@@ -431,11 +474,13 @@ static int CmdHFFelicaInfo(const char *Cmd) {
 
     void *argtable[] = {
         arg_param_begin,
+        arg_lit0("v", "verbose", "verbose output"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
+    bool verbose = arg_get_lit(ctx, 1);
     CLIParserFree(ctx);
-    return info_felica(false);
+    return info_felica(verbose);
 }
 
 /**
@@ -474,6 +519,53 @@ static void print_rd_plain_response(felica_read_without_encryption_response_t *r
         PrintAndLogEx(SUCCESS, "  Status flag 1... %s", sprint_hex(rd_noCry_resp->status_flags.status_flag1, sizeof(rd_noCry_resp->status_flags.status_flag1)));
         PrintAndLogEx(SUCCESS, "  Status flag 2... %s", sprint_hex(rd_noCry_resp->status_flags.status_flag1, sizeof(rd_noCry_resp->status_flags.status_flag1)));
     }
+}
+
+/**
+ * Prints read-without-encryption response.
+ * @param rd_noCry_resp Response frame.
+ */
+static void print_suica_response(felica_read_without_encryption_response_t *rd_noCry_resp) {
+
+    if (rd_noCry_resp->status_flags.status_flag1[0] != 00 ||
+        rd_noCry_resp->status_flags.status_flag2[0] != 00) {
+
+
+        PrintAndLogEx(ERR, "IDm... %s", sprint_hex_inrow(rd_noCry_resp->frame_response.IDm, sizeof(rd_noCry_resp->frame_response.IDm)));
+        PrintAndLogEx(ERR, "  Status flag 1... %s", sprint_hex(rd_noCry_resp->status_flags.status_flag1, sizeof(rd_noCry_resp->status_flags.status_flag1)));
+        PrintAndLogEx(ERR, "  Status flag 2... %s", sprint_hex(rd_noCry_resp->status_flags.status_flag1, sizeof(rd_noCry_resp->status_flags.status_flag1)));
+        return;
+    }
+
+    char *temp = sprint_hex(rd_noCry_resp->block_data, sizeof(rd_noCry_resp->block_data));
+
+    char bl_data[256];
+    strncpy(bl_data, temp, sizeof(bl_data) - 1);
+
+    char bl_element_number[4];
+    temp = sprint_hex(rd_noCry_resp->block_element_number, sizeof(rd_noCry_resp->block_element_number));
+    strncpy(bl_element_number, temp, sizeof(bl_element_number) - 1);
+
+    // Just testing stuff
+    struct h {
+        uint8_t console;
+        uint8_t process;
+        uint16_t date_raw;
+        uint16_t balance;
+    } PACKED suica_history;
+
+
+    suica_history.console = rd_noCry_resp->block_data[0];
+    suica_history.process = rd_noCry_resp->block_data[1];
+    suica_history.date_raw = rd_noCry_resp->block_data[4] * 256 + rd_noCry_resp->block_data[5]; // big endian
+    suica_history.balance = rd_noCry_resp->block_data[11] * 256 + rd_noCry_resp->block_data[10]; // little endian
+
+    PrintAndLogEx(INFO, "Block: %s | %s  ", bl_element_number, bl_data);
+    PrintAndLogEx(INFO, "Console: %s", suica_console_name(suica_history.console));
+    PrintAndLogEx(INFO, "Process: %s", suica_process_name(suica_history.process));
+    PrintAndLogEx(INFO, "Date: (20)%02d-%02d-%02d", (suica_history.date_raw >> 9) & 0x7f, (suica_history.date_raw >> 5) & 0x0f, suica_history.date_raw & 0x1f );
+    PrintAndLogEx(INFO, "Balance: %d", suica_history.balance);
+
 }
 
 /**
@@ -1271,6 +1363,98 @@ static int CmdHFFelicaReadPlain(const char *Cmd) {
         }
     }
     return PM3_SUCCESS;
+}
+
+/**
+ * Command parser for rdunencrypted.
+ * @param Cmd input data of the user.
+ * @return client result code.
+ */
+static int CmdHFFelicaReadSuica(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf felica rdsuica",
+                  "Use this command to suica history.\n\n"
+                  " - Mode shall be Mode0.\n"
+                  " - Successful == block data\n"
+                  " - Unsuccessful == Status Flag1 and Flag2",
+                  "hf felica rdbl --sn 01 --scl 8B00 --bn 01 --ble 8000\n"
+                  "hf felica rdbl --sn 01 --scl 4B18 --bn 01 --ble 8000 -b\n"
+                  "hf felica rdbl -i 01100910c11bc407 --sn 01 --scl 8B00 --bn 01 --ble 8000\n"
+    );
+    void *argtable[] = {
+            arg_param_begin,
+            arg_str0("i", NULL, "<hex>", "set custom IDm"),
+            arg_lit0("v", "verbose", "verbose output"),
+            arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+
+    uint8_t idm[8] = {0};
+    int ilen = 0;
+    int res = CLIParamHexToBuf(arg_get_str(ctx, 1), idm, sizeof(idm), &ilen);
+    if (res) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    bool verbose = arg_get_lit(ctx, 1);
+    CLIParserFree(ctx);
+
+
+    PrintAndLogEx(INFO, "Suica Command");
+    if (verbose) {
+        PrintAndLogEx(INFO, "Verbose");
+    }
+
+
+    uint8_t data[PM3_CMD_DATA_SIZE];
+    memset(data, 0, sizeof(data));
+    data[0] = 0x10; // Static length
+    data[1] = 0x06; // Command ID
+
+    bool custom_IDm = false;
+    if (ilen) {
+        custom_IDm = true;
+        memcpy(data + 2, idm, sizeof(idm));
+    }
+
+    uint16_t datalen = 16; // Length (1), Command ID (1), IDm (8), Number of Service (1), Service Code List(2), Number of Block(1), Block List(3)
+    if (custom_IDm  == false && check_last_idm(data, datalen) == false) {
+        return PM3_EINVARG;
+    }
+
+
+    // Service Number 1
+    data[10] = 0x01;
+
+    // Service Code 090F
+    data[11] = 0x0F;
+    data[12] = 0x09;
+
+    // Block Number (?)
+    data[13] = 0x01;
+
+    // Block List (?)
+    data[14] = 0x80;
+    data[15] = 0x00; // this goes from 0x00 to 0x13
+
+
+    uint8_t flags = (FELICA_APPEND_CRC | FELICA_RAW);
+    AddCrc(data, datalen);
+    datalen += 2;
+    felica_read_without_encryption_response_t rd_noCry_resp;
+
+    int status = send_rd_plain(flags, datalen, data, 1, &rd_noCry_resp);
+    if (status != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Unable to retrieve suica data");
+        return status;
+    }
+
+    print_suica_response(&rd_noCry_resp);
+
+    return PM3_SUCCESS;
+
 }
 
 /**
@@ -2199,6 +2383,7 @@ static command_t CommandTable[] = {
     {"reader",          CmdHFFelicaReader,                IfPm3Felica,     "Act like an ISO18092/FeliCa reader"},
     {"sniff",           CmdHFFelicaSniff,                 IfPm3Felica,     "Sniff ISO 18092/FeliCa traffic"},
     {"wrbl",            CmdHFFelicaWritePlain,            IfPm3Felica,     "write block data to an authentication-not-required Service."},
+    {"rdsuica",         CmdHFFelicaReadSuica,             IfPm3Felica,     "read suica data (test)"},
     {"-----------",     CmdHelp,                          AlwaysAvailable, "----------------------- " _CYAN_("FeliCa Standard") " -----------------------"},
     //{"dump",          CmdHFFelicaDump,                    IfPm3Felica,     "Wait for and try dumping FeliCa"},
     {"rqservice",       CmdHFFelicaRequestService,        IfPm3Felica,     "verify the existence of Area and Service, and to acquire Key Version."},
