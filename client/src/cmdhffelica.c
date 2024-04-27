@@ -277,16 +277,21 @@ static const char *suica_console_name(uint8_t console_id) {
         default:
             break;
     }
-    return "Unknown Console";
+    static char unknownProcessString[20];
+    sprintf(unknownProcessString, "Unknown Console: 0x%02X", console_id);
+    return unknownProcessString;
 }
 
 static const char *suica_process_name(uint8_t process_id) {
     // source: https://github.com/m2wasabi/nfcpy-suica-sample/blob/e550c704890ba66149fcbb5f78ce15e66bc2ef60/suica_read.py#L82
+    // source 2: https://github.com/metrodroid/metrodroid/blob/25f3da5c26d77c54e5b49b9aa499d9a885d4a8df/src/commonMain/kotlin/au/id/micolous/metrodroid/transit/suica/SuicaUtil.kt#L290
     switch (process_id) {
         case 0x01:
             return "Fare Payment";
         case 0x02:
             return "Charge";
+        case 0x0d:
+            return "Bus (PiTaPa)";
         case 0x0f:
             return "Bus";
         case 0x46:
@@ -294,7 +299,9 @@ static const char *suica_process_name(uint8_t process_id) {
         default:
             break;
     }
-    return "Unknown Process";
+    static char unknownProcessString[20];
+    sprintf(unknownProcessString, "Unknown Process: 0x%02X", process_id);
+    return unknownProcessString;
 }
 
 /**
