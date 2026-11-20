@@ -28,7 +28,7 @@ void ModThenAcquireRawAdcSamples125k(uint32_t delay_off, uint16_t period_0, uint
 void ReadTItag(bool ledcontrol);
 void WriteTItag(uint32_t idhi, uint32_t idlo, uint16_t crc, bool ledcontrol);
 
-void AcquireTiType(bool ledcontrol);
+uint32_t AcquireTiType(bool ledcontrol);
 void AcquireRawBitsTI(void);
 void SimulateTagLowFrequencyEx(int period, int gap, bool ledcontrol, int numcycles);
 void SimulateTagLowFrequency(int period, int gap, bool ledcontrol);

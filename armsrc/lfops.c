@@ -530,8 +530,16 @@ The old model is single page, while the new model is multi page, with different 
 https://e2e.ti.com/support/wireless-connectivity/other-wireless-group/other-wireless/f/other-wireless-technologies-forum/863988/ri-trp-wr2b-30-replacement-part?tisearch=e2e-sitesearch&keymatch=RI-TRP-WR2B#
 
 */
+// TIRIS samples are captured MSB first into 32 bit words. Return sample s as
+// +1/-1 without unpacking the whole 40K trace into BigBuf (which is only
+// ~30K on AT91 and would overflow into the stack).
+static inline int ti_sample(const uint32_t *buf, uint32_t s) {
+    return ((buf[s >> 5] >> (31 - (s & 31))) & 1u) ? 1 : -1;
+}
+
 void ReadTItag(bool ledcontrol) {
     StartTicks();
+    Dbprintf("TI: read start");
     // some hardcoded initial params
     // when we read a TI tag we sample the zerocross line at 2MHz
     // TI tags modulate a 1 as 16 cycles of 123.2kHz
@@ -540,16 +548,18 @@ void ReadTItag(bool ledcontrol) {
 #define FREQLO 123200
 #define FREQHI 134200
 
-    signed char *dest = (signed char *)BigBuf_get_addr();
-    uint32_t n = BigBuf_max_traceLen();
+    uint32_t *buf;
+    uint32_t n;
     // 128 bit shift register [shift3:shift2:shift1:shift0]
     uint32_t shift3 = 0, shift2 = 0, shift1 = 0, shift0 = 0;
 
     int i, cycles = 0, samples = 0;
     // how many sample points fit in 16 cycles of each frequency
     uint32_t sampleslo = (FSAMPLE << 4) / FREQLO, sampleshi = (FSAMPLE << 4) / FREQHI;
-    // when to tell if we're close enough to one freq or another
-    uint32_t threshold = (sampleslo - sampleshi + 1) >> 1;
+    // accept a generous window around each tone and classify by the midpoint.
+    // 2 MHz -> ~259 samples per 16 cycles @123.2 kHz, ~238 @134.2 kHz.
+    const int tone_tol = 20;
+    const int sample_mid = (int)((sampleslo + sampleshi) >> 1);
 
     // TI tags charge at 134.2kHz
     FpgaDownloadAndGo(FPGA_BITSTREAM_LF);
@@ -561,10 +571,21 @@ void ReadTItag(bool ledcontrol) {
     // or listening to the antenna (low)
     FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_PASSTHRU);
 
+    Dbprintf("TI: fpga ready");
+
     // get TI tag data into the buffer
-    AcquireTiType(ledcontrol);
+    n = AcquireTiType(ledcontrol);
+    buf = (uint32_t *)BigBuf_get_addr();
+
+    Dbprintf("TI: acquire returned %u", (unsigned)n);
 
     FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+
+    if (n < 32) {
+        DbpString("Info: No TI tag response captured.");
+        StopTicks();
+        return;
+    }
 
     // 周期的判断，就是实际上固定的频率采集到的数据，计算实际上所需的过零点的数量，在整个频率内所占用的采集点的数量
     // 比如123khz的数据调制，从0跨越到1需要更多的时间，那实际上所耗费的在固定频率下所采集的数据的数量更多。
@@ -581,7 +602,7 @@ void ReadTItag(bool ledcontrol) {
 
     for (i = 0; i < n - 1; i++) {
         // count cycles by looking for lo to hi zero crossings
-        if ((dest[i] < 0) && (dest[i + 1] > 0)) {
+        if ((ti_sample(buf, i) < 0) && (ti_sample(buf, i + 1) > 0)) {
             cycles++;
             // after 16 cycles, measure the frequency
             if (cycles > 15) {
@@ -595,17 +616,13 @@ void ReadTItag(bool ledcontrol) {
                 shift2 = (shift2 >> 1) | (shift3 << 31);
                 shift3 >>= 1;
 
-                // check if the cycles fall close to the number
-                // expected for either the low or high frequency
-                if ((samples > (sampleslo - threshold)) && (samples < (sampleslo + threshold))) {
-                    // low frequency represents a 1
-                    shift3 |= (1u << 31);
-                } else if ((samples > (sampleshi - threshold)) && (samples < (sampleshi + threshold))) {
-                    // high frequency represents a 0
-                } else {
-                    // probably detected a gay waveform or noise
-                    // use this as gaydar or discard shift register and start again
+                // check if the measured interval is close to one of the two tones
+                if ((samples > (int)sampleslo + tone_tol) || (samples < (int)sampleshi - tone_tol)) {
+                    // out of range, discard shift register and start again
                     shift3 = shift2 = shift1 = shift0 = 0;
+                } else if (samples >= sample_mid) {
+                    // low frequency (123.2 kHz) represents a 1
+                    shift3 |= (1u << 31);
                 }
                 samples = i;
 
@@ -648,26 +665,42 @@ void ReadTItag(bool ledcontrol) {
             DbpString("Info: TI tag is readonly");
         }
 
-        // WARNING the order of the bytes in which we calc crc below needs checking
-        // i'm 99% sure the crc algorithm is correct, but it may need to eat the
-        // bytes in reverse or something
-        // calculate CRC
-        uint32_t crc = 0;
+        // TIRIS read-only (4C) uses CRC-16/KERMIT over the 8 data bytes.
+        uint8_t frame[8];
+        frame[0] = (shift0) & 0xff;
+        frame[1] = (shift0 >> 8) & 0xff;
+        frame[2] = (shift0 >> 16) & 0xff;
+        frame[3] = (shift0 >> 24) & 0xff;
+        frame[4] = (shift1) & 0xff;
+        frame[5] = (shift1 >> 8) & 0xff;
+        frame[6] = (shift1 >> 16) & 0xff;
+        frame[7] = (shift1 >> 24) & 0xff;
 
-        crc = update_crc16(crc, (shift0) & 0xff);
-        crc = update_crc16(crc, (shift0 >> 8) & 0xff);
-        crc = update_crc16(crc, (shift0 >> 16) & 0xff);
-        crc = update_crc16(crc, (shift0 >> 24) & 0xff);
-        crc = update_crc16(crc, (shift1) & 0xff);
-        crc = update_crc16(crc, (shift1 >> 8) & 0xff);
-        crc = update_crc16(crc, (shift1 >> 16) & 0xff);
-        crc = update_crc16(crc, (shift1 >> 24) & 0xff);
+        uint16_t crc = 0;
+        for (int b = 0; b < 8; b++) {
+            crc ^= frame[b];
+            for (int bit = 0; bit < 8; bit++) {
+                if (crc & 1) {
+                    crc = (crc >> 1) ^ 0x8408;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        uint16_t rx_crc = shift2 & 0xffff;
+        uint16_t rx_crc_swapped = (rx_crc >> 8) | (rx_crc << 8);
 
-        Dbprintf("Info: Tag data: %x%08x, crc=%x", (unsigned int)shift1, (unsigned int)shift0, (unsigned int)shift2 & 0xFFFF);
-        if (crc != (shift2 & 0xffff)) {
-            Dbprintf("Error: CRC mismatch, expected %x", (unsigned int)crc);
-        } else {
+        Dbprintf("TI raw: %02x %02x %02x %02x %02x %02x %02x %02x",
+                 frame[0], frame[1], frame[2], frame[3],
+                 frame[4], frame[5], frame[6], frame[7]);
+        Dbprintf("Info: Tag data: %08x%08x, crc=%04x calc=%04x",
+                 (unsigned int)shift1, (unsigned int)shift0,
+                 (unsigned int)rx_crc, (unsigned int)crc);
+
+        if (crc == rx_crc || crc == rx_crc_swapped) {
             DbpString("Info: CRC is good");
+        } else {
+            DbpString("Warning: CRC mismatch (ID may still be valid)");
         }
     }
     StopTicks();
@@ -696,11 +729,13 @@ static void WriteTIbyte(uint8_t b) {
     }
 }
 
-void AcquireTiType(bool ledcontrol) {
-    int i, j, n;
-    // tag transmission is <20ms, sampling at 2M gives us 40K samples max
-    // each sample is 1 bit stuffed into a uint32_t so we need 1250 uint32_t
-#define TIBUFLEN 1250
+uint32_t AcquireTiType(bool ledcontrol) {
+    int i;
+    uint32_t n, guard;
+    // Listen for up to 80 ms (160K samples). The tag normally answers within
+    // 20 ms, but a saturated comparator can take longer to recover.
+    // Each sample is one bit in a uint32_t, so 5000 words = 20 KB.
+#define TIBUFLEN 5000
 
     // clear buffer
     uint32_t *buf = (uint32_t *)BigBuf_get_addr();
@@ -708,74 +743,135 @@ void AcquireTiType(bool ledcontrol) {
     //clear buffer now so it does not interfere with timing later
     BigBuf_Clear_ext(false);
 
-    // TODO DXL Waiting for cross-platform implementation.
+    Dbprintf("TI: acquire start");
 
-    // Set up the synchronous serial port
-    AT91C_BASE_PIOA->PIO_PDR = GPIO_SSC_DIN;
-    AT91C_BASE_PIOA->PIO_ASR = GPIO_SSC_DIN;
+    // Set up the SSC through the HAL first: it enables the peripheral clock,
+    // configures the pins and performs a proper reset. The previous code wrote
+    // the SSC registers directly in the wrong order (enable before divider and
+    // frame mode), which can leave the receiver unclocked so RXRDY never
+    // asserts and the capture loop spins forever.
+    FpgaSetupSsc(FPGA_MAJOR_MODE_LF_PASSTHRU);
+    WaitMS(1);
+
+    Dbprintf("TI: ssc init");
 
     AT91C_BASE_SSC->SSC_CR = AT91C_SSC_SWRST;
-    AT91C_BASE_SSC->SSC_CR = AT91C_SSC_RXEN | AT91C_SSC_TXEN;
+    WaitMS(1);
 
-    // Sample at 2 Mbit/s, so TI tags are 16.2 vs. 14.9 clocks long
-    // 48/2 = 24 MHz clock must be divided by 12
+    // Sample at 2 MHz: MCK / (2 * DIV) = 48 MHz / (2 * 12)
     AT91C_BASE_SSC->SSC_CMR = 12;
-
+    // receiver clock = divided clock, continuous
     AT91C_BASE_SSC->SSC_RCMR = SSC_CLOCK_MODE_SELECT(0);
+    // 32 bit words, MSB first
     AT91C_BASE_SSC->SSC_RFMR = SSC_FRAME_MODE_BITS_IN_WORD(32) | AT91C_SSC_MSBF;
     // Transmit Clock Mode Register
     AT91C_BASE_SSC->SSC_TCMR = 0;
     // Transmit Frame Mode Register
     AT91C_BASE_SSC->SSC_TFMR = 0;
 
-    // iceman, FpgaSetupSsc(FPGA_MAJOR_MODE_LF_READER) ?? the code above? can it be replaced?
+    // drop anything already sitting in the receiver (bounded, never spin here)
+    for (int d = 0; d < 64 && FPGA_SSC_RX_Ready(); d++) {
+        (void)FPGA_SSC_RX_Value();
+    }
 
     // steal this pin from the SSP and use it to control the modulation
     gpio_fpga_mod_only_setup();
 
+    // Self-test: drive the field through passthru and confirm cross_lo toggles.
+    // A 134 kHz square wave should produce alternating blocks of 0s and 1s.
+    Gpio_SSC_DOUT_High();
+    WaitMS(1);
+    AT91C_BASE_SSC->SSC_CR = AT91C_SSC_RXEN;
+    for (int t = 0; t < 16; t++) {
+        uint32_t g = 0;
+        while (!FPGA_SSC_RX_Ready() && g < 100000) {
+            g++;
+            WDT_HIT();
+        }
+        buf[t] = FPGA_SSC_RX_Value();
+    }
+    AT91C_BASE_SSC->SSC_CR = AT91C_SSC_RXDIS;
+    Gpio_SSC_DOUT_Low();
+    Dbprintf("TI: selftest %08x %08x %08x %08x",
+             (unsigned)buf[0], (unsigned)buf[1], (unsigned)buf[2], (unsigned)buf[3]);
+
+    // passthru listens while ssp_dout is low
+    Gpio_SSC_DOUT_Low();
+
     if (ledcontrol) LED_D_ON();
 
-    // start modulate antenna
-    Gpio_SSC_DOUT_High();
+    // Charge the tag with the normal LF reader field. The passthru H-bridge
+    // is weak and may not couple enough energy into a small transponder.
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_READER | FPGA_LF_ADC_READER_FIELD);
+    WaitMS(100);
 
-    // Charge TI tag for 50ms.
-    WaitMS(50);
-
-    // stop modulating antenna and listen
-    Gpio_SSC_DOUT_Low();
+    // Drop the field and switch to passthru to listen to the tag's FSK.
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_PASSTHRU);
+    WaitMS(1);
 
     if (ledcontrol) LED_D_OFF();
 
+    Dbprintf("TI: listening cmr=%08x rcmr=%08x rfmr=%08x sr=%08x",
+             (unsigned)AT91C_BASE_SSC->SSC_CMR,
+             (unsigned)AT91C_BASE_SSC->SSC_RCMR,
+             (unsigned)AT91C_BASE_SSC->SSC_RFMR,
+             (unsigned)AT91C_BASE_SSC->SSC_SR);
+
+    // start sampling only once the field is gone, so the buffer begins at
+    // the tag response instead of the carrier
+    AT91C_BASE_SSC->SSC_CR = AT91C_SSC_RXEN;
+
     i = 0;
-    for (;;) {
+    guard = 0;
+    while (i < TIBUFLEN) {
         if (FPGA_SSC_RX_Ready()) {
             buf[i] = FPGA_SSC_RX_Value(); // store 32 bit values in buffer
             i++;
-            if (i >= TIBUFLEN) break;
+        }
+        // hard timeout: never let a missing tag wedge the firmware
+        if (++guard > 2000000) {
+            break;
         }
         WDT_HIT();
+    }
+
+    Dbprintf("TI: captured %d words sr=%08x", i, (unsigned)AT91C_BASE_SSC->SSC_SR);
+
+    if (i >= 4) {
+        Dbprintf("TI: w0=%08x w1=%08x w2=%08x w3=%08x",
+                 (unsigned)buf[0], (unsigned)buf[1], (unsigned)buf[2], (unsigned)buf[3]);
     }
 
     // return stolen pin to SSP
     AT91C_BASE_PIOA->PIO_PDR = GPIO_SSC_DOUT;
     AT91C_BASE_PIOA->PIO_ASR = GPIO_SSC_DIN | GPIO_SSC_DOUT;
 
-    char *dest = (char *)BigBuf_get_addr();
-    n = TIBUFLEN * 32;
+    n = (uint32_t)i * 32;
 
-    // unpack buffer
-    for (i = TIBUFLEN - 1; i >= 0; i--) {
-        for (j = 0; j < 32; j++) {
-            if (buf[i] & (1u << j)) {
-                dest[--n] = 1;
-            } else {
-                dest[--n] = -1;
-            }
+    if (i < 8) {
+        Dbprintf("TI: only %u words captured, no tag response", (unsigned)i);
+        FpgaSetupSsc(FPGA_MAJOR_MODE_LF_READER);
+        return 0;
+    }
+
+    // signal quality: a TIRIS half period is ~7.5 samples at 2 MHz,
+    // noise is ~1-2. Useful to distinguish "no decode" from "no coupling".
+    uint32_t transitions = 0, run_sum = 0, last = 0;
+    for (uint32_t m = 1; m < n; m++) {
+        if (ti_sample(buf, m) != ti_sample(buf, m - 1)) {
+            transitions++;
+            run_sum += (m - last);
+            last = m;
         }
     }
+    uint32_t avg_half = transitions ? (run_sum / transitions) : 0;
+    Dbprintf("TI: words=%u samples=%u transitions=%u avg_half=%u",
+             (unsigned)i, (unsigned)n, (unsigned)transitions, (unsigned)avg_half);
 
     // reset SSC
     FpgaSetupSsc(FPGA_MAJOR_MODE_LF_READER);
+
+    return n;
 }
 
 // arguments: 64bit data split into 32bit idhi:idlo and optional 16bit crc
@@ -843,7 +939,7 @@ void WriteTItag(uint32_t idhi, uint32_t idlo, uint16_t crc, bool ledcontrol) {
     if (ledcontrol) LED_A_OFF();
 
     // get TI tag data into the buffer
-    AcquireTiType(ledcontrol);
+    (void)AcquireTiType(ledcontrol);
 
     FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
     DbpString("Now use `lf ti reader` to check");
